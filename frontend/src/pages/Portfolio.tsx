@@ -42,21 +42,48 @@ const Portfolio: React.FC = () => {
   const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+
+  const fetchAssets = async () => {
+    try {
+      setLoading(true);
+      const response = await axios.get('http://localhost:8000/api/portfolio/assets');
+      setAssets(response.data);
+      setLastUpdate(new Date());
+    } catch (err) {
+      setError('Failed to fetch portfolio assets');
+      console.error('Error fetching assets:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRefresh = async () => {
+    try {
+      setRefreshing(true);
+      setRefreshError(null);
+      const response = await axios.get('http://localhost:8000/api/portfolio/update-prices');
+      
+      // Handle failed updates
+      if (response.data.failed_assets && response.data.failed_assets.length > 0) {
+        const failedSymbols = response.data.failed_assets.map((asset: any) => 
+          `${asset.symbol} (${asset.reason})`
+        ).join(', ');
+        setRefreshError(`Failed to update some prices: ${failedSymbols}`);
+      }
+      
+      await fetchAssets();
+    } catch (err) {
+      console.error('Error refreshing prices:', err);
+      setRefreshError('Failed to refresh prices. Please try again later.');
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   useEffect(() => {
-    const fetchAssets = async () => {
-      try {
-        setLoading(true);
-        const response = await axios.get('http://localhost:8000/api/portfolio/assets');
-        setAssets(response.data);
-      } catch (err) {
-        setError('Failed to fetch portfolio assets');
-        console.error('Error fetching assets:', err);
-      } finally {
-        setLoading(false);
-      }
-    };
-
     fetchAssets();
     // Refresh data every minute
     const interval = setInterval(fetchAssets, 60000);
@@ -104,14 +131,36 @@ const Portfolio: React.FC = () => {
       <Grid item xs={12}>
         <Paper sx={{ p: 3 }}>
           <Grid container alignItems="center" justifyContent="space-between" mb={3}>
-            <Typography variant="h5">My Investments</Typography>
-            <Button
-              variant="contained"
-              startIcon={<AddIcon />}
-              onClick={handleAddClick}
-            >
-              Add Investment
-            </Button>
+            <Box>
+              <Typography variant="h5">My Investments</Typography>
+              {lastUpdate && (
+                <Typography variant="caption" color="text.secondary">
+                  Last updated: {lastUpdate.toLocaleTimeString()}
+                </Typography>
+              )}
+              {refreshError && (
+                <Typography variant="caption" color="error" display="block">
+                  {refreshError}
+                </Typography>
+              )}
+            </Box>
+            <Box sx={{ display: 'flex', gap: 2 }}>
+              <Button
+                variant="outlined"
+                onClick={handleRefresh}
+                disabled={refreshing}
+                startIcon={<CircularProgress size={16} sx={{ display: refreshing ? 'inline-flex' : 'none' }} />}
+              >
+                Refresh Prices
+              </Button>
+              <Button
+                variant="contained"
+                startIcon={<AddIcon />}
+                onClick={handleAddClick}
+              >
+                Add Investment
+              </Button>
+            </Box>
           </Grid>
 
           <TableContainer>
@@ -138,7 +187,12 @@ const Portfolio: React.FC = () => {
                     <TableCell>{asset.type}</TableCell>
                     <TableCell align="right">{asset.quantity.toFixed(4)}</TableCell>
                     <TableCell align="right">${asset.purchase_price.toFixed(2)}</TableCell>
-                    <TableCell align="right">${asset.current_price.toFixed(2)}</TableCell>
+                    <TableCell align="right">
+                      ${asset.current_price.toFixed(2)}
+                      <Typography variant="caption" display="block" color="text.secondary">
+                        {new Date(asset.last_updated).toLocaleTimeString()}
+                      </Typography>
+                    </TableCell>
                     <TableCell align="right">${asset.current_value.toFixed(2)}</TableCell>
                     <TableCell
                       align="right"

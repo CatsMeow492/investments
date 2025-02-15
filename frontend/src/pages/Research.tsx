@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
+import ReactMarkdown from 'react-markdown';
 import {
   Grid,
   Paper,
@@ -16,6 +17,10 @@ import {
   Switch,
   FormControlLabel,
   Chip,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
 } from '@mui/material';
 import { Send as SendIcon, Search as SearchIcon } from '@mui/icons-material';
 
@@ -32,17 +37,63 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
+  model?: string;
 }
 
 interface ResearchResponse {
   answer: string;
-  sources: string[];
-  context_used: any;
+  sources: {
+    query: string;
+    portfolio?: {
+      summary: {
+        total_value: number;
+        total_cost: number;
+        total_gain_loss: number;
+        gain_loss_percentage: number;
+        asset_count: number;
+        type_allocation: Record<string, number>;
+      };
+      assets: Array<{
+        symbol: string;
+        name: string;
+        type: string;
+        quantity: number;
+        current_price: number;
+        purchase_price: number;
+        current_value: number;
+        weight: number;
+        gain_loss: number;
+        gain_loss_percentage: number;
+      }>;
+    };
+    asset?: {
+      symbol: string;
+      name: string;
+      type: string;
+      quantity: number;
+      current_price: number;
+      purchase_price: number;
+      current_value: number;
+      portfolio_weight: number;
+      gain_loss: number;
+      gain_loss_percentage: number;
+    };
+    web_data?: any;
+    timestamp: string;
+  };
+  model_used: string;
 }
 
 interface SuggestedQuery {
   text: string;
   description: string;
+}
+
+interface ModelInfo {
+  id: string;
+  name: string;
+  description: string;
+  is_available: boolean;
 }
 
 const portfolioSuggestedQueries: SuggestedQuery[] = [
@@ -95,8 +146,30 @@ const Research: React.FC = () => {
   const [query, setQuery] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [useWeb, setUseWeb] = useState(true);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const messagesEndRef = useRef<null | HTMLDivElement>(null);
   const [showSuggestions, setShowSuggestions] = useState(true);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [currentStreamedMessage, setCurrentStreamedMessage] = useState('');
+
+  // Fetch available models
+  useEffect(() => {
+    const fetchModels = async () => {
+      try {
+        const response = await axios.get('http://localhost:8000/api/models');
+        setModels(response.data);
+        // Set first available model as default
+        const availableModel = response.data.find((m: ModelInfo) => m.is_available);
+        if (availableModel) {
+          setSelectedModel(availableModel.id);
+        }
+      } catch (err) {
+        console.error('Error fetching models:', err);
+      }
+    };
+    fetchModels();
+  }, []);
 
   // Fetch portfolio assets
   useEffect(() => {
@@ -118,8 +191,28 @@ const Research: React.FC = () => {
 
   // Auto-scroll to bottom of chat
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    const scrollToBottom = () => {
+      if (messagesEndRef.current) {
+        messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+      }
+    };
+
+    // Scroll when messages change
+    scrollToBottom();
+
+    // Set up an interval to scroll while streaming
+    let scrollInterval: NodeJS.Timeout | null = null;
+    if (isStreaming) {
+      scrollInterval = setInterval(scrollToBottom, 100); // Scroll every 100ms while streaming
+    }
+
+    // Cleanup interval
+    return () => {
+      if (scrollInterval) {
+        clearInterval(scrollInterval);
+      }
+    };
+  }, [messages, isStreaming, currentStreamedMessage]); // Add currentStreamedMessage as dependency
 
   const handleSuggestedQuery = (queryText: string) => {
     setQuery(queryText);
@@ -172,22 +265,57 @@ I can help you analyze your portfolio's composition, risk factors, performance, 
 
     setMessages(prev => [...prev, userMessage]);
     setQuery('');
+    setIsStreaming(true);
+    setCurrentStreamedMessage('');
 
     try {
-      setLoading(true);
-      const response = await axios.post<ResearchResponse>('http://localhost:8000/api/research/query', {
-        query: query,
-        context: {
-          include_portfolio: !selectedAsset,
-          symbol: selectedAsset?.symbol || null,
-        },
-        should_use_web: useWeb,
-      });
+      let accumulatedContent = '';
+      let modelUsed = '';
 
+      const response = await axios.post<ResearchResponse>(
+        'http://localhost:8000/api/research/query',
+        {
+          query: query,
+          context: {
+            include_portfolio: !selectedAsset,
+            symbol: selectedAsset?.symbol || null,
+          },
+          should_use_web: useWeb,
+          model: selectedModel,
+        },
+        {
+          responseType: 'text',
+          onDownloadProgress: (progressEvent) => {
+            const data = progressEvent.event.target.responseText;
+            try {
+              // Split the response by newlines to handle streaming JSON
+              const lines = data.split('\n');
+              for (const line of lines) {
+                if (line.trim()) {
+                  const parsedData = JSON.parse(line);
+                  if (parsedData.answer) {
+                    accumulatedContent += parsedData.answer;
+                    setCurrentStreamedMessage(accumulatedContent);
+                    if (parsedData.model_used) {
+                      modelUsed = parsedData.model_used;
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              // Ignore JSON parse errors for incomplete chunks
+              console.debug('Parse error for chunk:', e);
+            }
+          }
+        }
+      );
+
+      // Create the final message once streaming is complete
       const assistantMessage: Message = {
         role: 'assistant',
-        content: response.data.answer,
+        content: accumulatedContent,
         timestamp: new Date().toISOString(),
+        model: modelUsed,
       };
 
       setMessages(prev => [...prev, assistantMessage]);
@@ -195,12 +323,14 @@ I can help you analyze your portfolio's composition, risk factors, performance, 
       console.error('Error sending query:', err);
       const errorMessage: Message = {
         role: 'assistant',
-        content: 'Sorry, I encountered an error processing your request.',
+        content: 'Sorry, I encountered an error processing your request. Please try again.',
         timestamp: new Date().toISOString(),
       };
       setMessages(prev => [...prev, errorMessage]);
     } finally {
-      setLoading(false);
+      setIsStreaming(false);
+      setCurrentStreamedMessage('');
+      setShowSuggestions(true);
     }
   };
 
@@ -214,15 +344,8 @@ I can help you analyze your portfolio's composition, risk factors, performance, 
           </Typography>
           <List>
             <ListItemButton
-              selected={!selectedAsset}
-              onClick={() => {
-                setSelectedAsset(null);
-                setMessages([{
-                  role: 'assistant',
-                  content: "I'm ready to help you research your entire portfolio. What would you like to know?",
-                  timestamp: new Date().toISOString(),
-                }]);
-              }}
+              selected={selectedAsset === null}
+              onClick={() => handleAssetSelect(null)}
             >
               <ListItemText primary="Entire Portfolio" />
             </ListItemButton>
@@ -235,12 +358,7 @@ I can help you analyze your portfolio's composition, risk factors, performance, 
               >
                 <ListItemText
                   primary={asset.symbol}
-                  secondary={asset.name}
-                />
-                <Chip
-                  label={`$${asset.current_value.toLocaleString()}`}
-                  size="small"
-                  color="primary"
+                  secondary={`${asset.name} - $${asset.current_value.toLocaleString()}`}
                 />
               </ListItemButton>
             ))}
@@ -251,88 +369,143 @@ I can help you analyze your portfolio's composition, risk factors, performance, 
       {/* Chat Interface */}
       <Grid item xs={12} md={9}>
         <Paper sx={{ p: 2, height: 'calc(100vh - 140px)', display: 'flex', flexDirection: 'column' }}>
-          <Box sx={{ mb: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <Typography variant="h6">
-              {selectedAsset ? `Research: ${selectedAsset.name} (${selectedAsset.symbol})` : 'Portfolio Research'}
-            </Typography>
+          {/* Model Selection and Web Data Toggle */}
+          <Box sx={{ mb: 2, display: 'flex', gap: 2, alignItems: 'center' }}>
+            <FormControl sx={{ minWidth: 200 }}>
+              <InputLabel>AI Model</InputLabel>
+              <Select
+                value={selectedModel || ''}
+                label="AI Model"
+                onChange={(e) => setSelectedModel(e.target.value)}
+              >
+                {models.map((model) => (
+                  <MenuItem
+                    key={model.id}
+                    value={model.id}
+                    disabled={!model.is_available}
+                  >
+                    <Box>
+                      <Typography variant="body1">
+                        {model.name}
+                        {!model.is_available && ' (Unavailable)'}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {model.description}
+                      </Typography>
+                    </Box>
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
             <FormControlLabel
               control={
                 <Switch
                   checked={useWeb}
                   onChange={(e) => setUseWeb(e.target.checked)}
-                  color="primary"
                 />
               }
-              label="Use Web Data"
+              label="Include Web Data"
             />
           </Box>
 
-          {/* Messages */}
-          <Box sx={{ flexGrow: 1, overflow: 'auto', mb: 2 }}>
+          {/* Messages Area */}
+          <Box 
+            sx={{ 
+              flexGrow: 1, 
+              overflow: 'auto', 
+              mb: 2,
+              scrollBehavior: 'smooth' // Add smooth scrolling
+            }}
+          >
             <List>
               {messages.map((message, index) => (
-                <ListItem
-                  key={index}
-                  sx={{
-                    backgroundColor: message.role === 'assistant' ? 'action.hover' : 'transparent',
-                    borderRadius: 1,
-                    mb: 1,
-                  }}
-                >
-                  <ListItemText
-                    primary={message.content}
-                    secondary={new Date(message.timestamp).toLocaleString()}
-                  />
+                <ListItem key={index} sx={{ flexDirection: 'column', alignItems: 'flex-start' }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+                    <Typography variant="caption" color="text.secondary">
+                      {message.role === 'assistant' ? 'AI Assistant' : 'You'}
+                    </Typography>
+                    {message.model && (
+                      <Chip
+                        label={models.find(m => m.id === message.model)?.name || message.model}
+                        size="small"
+                        variant="outlined"
+                      />
+                    )}
+                    <Typography variant="caption" color="text.secondary">
+                      {new Date(message.timestamp).toLocaleTimeString()}
+                    </Typography>
+                  </Box>
+                  <Box
+                    sx={{
+                      backgroundColor: message.role === 'assistant' ? 'action.hover' : 'transparent',
+                      p: message.role === 'assistant' ? 1 : 0,
+                      borderRadius: 1,
+                      width: '100%',
+                    }}
+                  >
+                    <ReactMarkdown>{message.content}</ReactMarkdown>
+                  </Box>
                 </ListItem>
               ))}
-              {showSuggestions && messages.length === 1 && (
-                <ListItem>
-                  <Box sx={{ width: '100%' }}>
-                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
-                      Suggested Questions:
+              {isStreaming && (
+                <ListItem sx={{ flexDirection: 'column', alignItems: 'flex-start' }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+                    <Typography variant="caption" color="text.secondary">
+                      AI Assistant
                     </Typography>
-                    <Grid container spacing={1}>
-                      {(selectedAsset ? assetSuggestedQueries : portfolioSuggestedQueries).map((query, index) => (
-                        <Grid item xs={12} key={index}>
-                          <Button
-                            variant="outlined"
-                            size="small"
-                            onClick={() => handleSuggestedQuery(query.text)}
-                            sx={{ justifyContent: 'flex-start', textAlign: 'left', width: '100%' }}
-                          >
-                            <Box>
-                              <Typography variant="body2">{query.text}</Typography>
-                              <Typography variant="caption" color="text.secondary">
-                                {query.description}
-                              </Typography>
-                            </Box>
-                          </Button>
-                        </Grid>
-                      ))}
-                    </Grid>
+                    <CircularProgress size={16} />
+                  </Box>
+                  <Box
+                    sx={{
+                      backgroundColor: 'action.hover',
+                      p: 1,
+                      borderRadius: 1,
+                      width: '100%',
+                    }}
+                  >
+                    <ReactMarkdown>{currentStreamedMessage}</ReactMarkdown>
                   </Box>
                 </ListItem>
               )}
+              <div ref={messagesEndRef} style={{ height: '1px' }} /> {/* Add minimal height to prevent layout shifts */}
             </List>
-            <div ref={messagesEndRef} />
           </Box>
 
-          {/* Input */}
+          {/* Suggested Queries */}
+          {showSuggestions && (
+            <Box sx={{ mb: 2 }}>
+              <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                Suggested Questions
+              </Typography>
+              <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                {(selectedAsset ? assetSuggestedQueries : portfolioSuggestedQueries)
+                  .map((suggestion, index) => (
+                    <Chip
+                      key={index}
+                      label={suggestion.text}
+                      onClick={() => handleSuggestedQuery(suggestion.text)}
+                      sx={{ mb: 1 }}
+                    />
+                  ))}
+              </Box>
+            </Box>
+          )}
+
+          {/* Input Area */}
           <Box sx={{ display: 'flex', gap: 1 }}>
             <TextField
               fullWidth
-              variant="outlined"
-              placeholder="Ask about your investments..."
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyPress={(e) => e.key === 'Enter' && handleSubmit()}
+              placeholder="Ask about your portfolio or selected asset..."
               disabled={loading}
             />
             <Button
               variant="contained"
               onClick={handleSubmit}
               disabled={loading || !query.trim()}
-              startIcon={loading ? <CircularProgress size={20} /> : <SendIcon />}
+              endIcon={loading ? <CircularProgress size={20} /> : <SendIcon />}
             >
               Send
             </Button>
