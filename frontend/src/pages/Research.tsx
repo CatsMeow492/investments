@@ -33,6 +33,15 @@ interface Asset {
   current_value: number;
 }
 
+interface PortfolioResponse {
+  assets: Asset[];
+  update_status: {
+    total_assets: number;
+    assets_needing_update: number;
+    next_update_attempt: string | null;
+  };
+}
+
 interface Message {
   role: 'user' | 'assistant';
   content: string;
@@ -176,8 +185,8 @@ const Research: React.FC = () => {
     const fetchAssets = async () => {
       try {
         setLoading(true);
-        const response = await axios.get('http://localhost:8000/api/portfolio/assets');
-        setAssets(response.data);
+        const response = await axios.get<PortfolioResponse>('http://localhost:8000/api/portfolio/assets');
+        setAssets(response.data.assets);
       } catch (err) {
         setError('Failed to fetch portfolio assets');
         console.error('Error fetching assets:', err);

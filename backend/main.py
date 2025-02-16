@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from typing import List, Optional, Dict, Any, AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import os
 from dotenv import load_dotenv
 import requests
@@ -223,74 +223,87 @@ async def update_portfolio_prices(db: Session = Depends(get_db)):
     """Update current prices for all assets in the portfolio"""
     try:
         assets = db.query(models.PortfolioAsset).all()
-        updated_assets = []
+        updated_assets = set()  # Use a set to prevent duplicates
         failed_assets = []
         
-        # Alpha Vantage has a rate limit of 5 calls per minute for free tier
-        RATE_LIMIT_DELAY = 12  # seconds between calls to stay within rate limit
+        # Only update prices if they're older than 24 hours
+        current_time = datetime.utcnow()
         
-        for asset in assets:
-            try:
-                if asset.asset_type.lower() == 'stock':
-                    # Fetch stock price from Alpha Vantage
-                    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={asset.symbol}&apikey={os.getenv('ALPHA_VANTAGE_API_KEY')}"
+        # Group assets by those needing updates
+        assets_needing_update = [
+            asset for asset in assets
+            if not asset.last_updated or 
+            (current_time - asset.last_updated).total_seconds() >= 24 * 3600
+        ]
+        
+        # Process in smaller batches to respect rate limits
+        BATCH_SIZE = 5  # Process 5 assets at a time
+        for i in range(0, len(assets_needing_update), BATCH_SIZE):
+            batch = assets_needing_update[i:i + BATCH_SIZE]
+            
+            for asset in batch:
+                try:
+                    if asset.asset_type.lower() == 'stock':
+                        url = f"https://api.polygon.io/v2/aggs/ticker/{asset.symbol}/prev?apiKey={os.getenv('POLYGON_API_KEY', 'sRu78wED36ZP1bwn8y20GfEj8URDCG5Y')}"
+                    else:  # crypto
+                        url = f"https://api.polygon.io/v2/aggs/ticker/X:{asset.symbol}USD/prev?apiKey={os.getenv('POLYGON_API_KEY', 'sRu78wED36ZP1bwn8y20GfEj8URDCG5Y')}"
+                    
                     response = requests.get(url)
                     data = response.json()
                     
-                    # Debug logging
-                    print(f"Alpha Vantage response for {asset.symbol}:", data)
-                    
-                    if "Global Quote" in data and "05. price" in data["Global Quote"]:
-                        asset.current_price = float(data["Global Quote"]["05. price"])
-                        asset.last_updated = datetime.utcnow()
+                    if data.get("status") == "OK" and data.get("resultsCount", 0) > 0:
+                        asset.current_price = float(data["results"][0]["c"])
+                        asset.last_updated = current_time
                         db.add(asset)
-                        updated_assets.append(asset)
-                    elif "Note" in data:  # API rate limit message
-                        print(f"Rate limit hit for {asset.symbol}: {data['Note']}")
-                        failed_assets.append({"symbol": asset.symbol, "reason": "Rate limit exceeded"})
+                        updated_assets.add(asset)  # Add to set instead of list
                     else:
-                        print(f"Invalid data format for {asset.symbol}: {data}")
-                        failed_assets.append({"symbol": asset.symbol, "reason": "Invalid data format"})
-                        
-                elif asset.asset_type.lower() == 'crypto':
-                    # For cryptocurrencies, use a different Alpha Vantage endpoint
-                    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={asset.symbol}&to_currency=USD&apikey={os.getenv('ALPHA_VANTAGE_API_KEY')}"
-                    response = requests.get(url)
-                    data = response.json()
-                    
-                    # Debug logging
-                    print(f"Alpha Vantage crypto response for {asset.symbol}:", data)
-                    
-                    if "Realtime Currency Exchange Rate" in data:
-                        asset.current_price = float(data["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
-                        asset.last_updated = datetime.utcnow()
-                        db.add(asset)
-                        updated_assets.append(asset)
-                    elif "Note" in data:  # API rate limit message
-                        print(f"Rate limit hit for crypto {asset.symbol}: {data['Note']}")
-                        failed_assets.append({"symbol": asset.symbol, "reason": "Rate limit exceeded"})
-                    else:
-                        print(f"Invalid crypto data format for {asset.symbol}: {data}")
-                        failed_assets.append({"symbol": asset.symbol, "reason": "Invalid data format"})
+                        if "error" in data and "exceeded" in data["error"].lower():
+                            # Rate limit hit, add delay and retry later
+                            failed_assets.append({
+                                "symbol": asset.symbol,
+                                "reason": "Rate limit exceeded, will retry later"
+                            })
+                        else:
+                            failed_assets.append({
+                                "symbol": asset.symbol,
+                                "reason": "No price data available"
+                            })
+                            
+                except Exception as e:
+                    print(f"Error updating price for {asset.symbol}: {str(e)}")
+                    failed_assets.append({
+                        "symbol": asset.symbol,
+                        "reason": str(e)
+                    })
                 
-                # Add delay to respect rate limits
-                await asyncio.sleep(RATE_LIMIT_DELAY)
-                
-            except Exception as e:
-                print(f"Error updating price for {asset.symbol}: {str(e)}")
-                failed_assets.append({"symbol": asset.symbol, "reason": str(e)})
-                continue
+                # Add delay between requests to respect rate limits
+                await asyncio.sleep(0.5)  # 500ms delay between requests
+            
+            # Add a longer delay between batches
+            await asyncio.sleep(2)  # 2 second delay between batches
+            db.commit()  # Commit each batch
         
-        db.commit()
+        # Add already up-to-date assets to updated_assets
+        up_to_date_assets = [
+            asset for asset in assets 
+            if asset not in assets_needing_update
+        ]
+        updated_assets.update(up_to_date_assets)  # Use set.update instead of extend
+        
+        # Convert set to list for the response
+        updated_assets_list = list(updated_assets)
         
         return {
-            "message": f"Updated prices for {len(updated_assets)} assets. Failed to update {len(failed_assets)} assets.",
+            "message": f"Updated prices for {len(updated_assets_list)} assets. {len(failed_assets)} assets pending update.",
             "updated_assets": [{
                 "symbol": asset.symbol,
                 "current_price": asset.current_price,
                 "last_updated": asset.last_updated
-            } for asset in updated_assets],
-            "failed_assets": failed_assets
+            } for asset in updated_assets_list],
+            "failed_assets": failed_assets,
+            "cache_info": {
+                "next_update": (datetime.utcnow() + timedelta(minutes=1)).isoformat() if failed_assets else None
+            }
         }
         
     except Exception as e:
@@ -302,38 +315,48 @@ async def get_portfolio_assets(db: Session = Depends(get_db)):
     try:
         assets = db.query(models.PortfolioAsset).all()
         
-        # Check if prices need updating (older than 5 minutes)
-        should_update = any(
-            not asset.last_updated or 
-            (datetime.utcnow() - asset.last_updated).total_seconds() > 300 
-            for asset in assets
-        )
+        # Check if prices need updating (older than 24 hours)
+        assets_needing_update = [
+            asset for asset in assets
+            if not asset.last_updated or 
+            (datetime.utcnow() - asset.last_updated).total_seconds() > 24 * 3600
+        ]
         
-        if should_update:
-            await update_portfolio_prices(db)
-            # Refresh assets after update
-            assets = db.query(models.PortfolioAsset).all()
+        # Start update in background if needed, but don't wait for it
+        if assets_needing_update:
+            background_tasks = BackgroundTasks()
+            background_tasks.add_task(update_portfolio_prices, db)
         
-        return [{
-            "symbol": asset.symbol,
-            "name": asset.name,
-            "type": asset.asset_type,
-            "quantity": asset.quantity,
-            "current_price": asset.current_price,
-            "purchase_price": asset.purchase_price,
-            "current_value": asset.quantity * asset.current_price,
-            "gain_loss": (asset.current_price - asset.purchase_price) * asset.quantity,
-            "gain_loss_percentage": ((asset.current_price - asset.purchase_price) / asset.purchase_price * 100) 
-                if asset.purchase_price > 0 else 0,
-            "last_updated": asset.last_updated
-        } for asset in assets]
+        return {
+            "assets": [{
+                "symbol": asset.symbol,
+                "name": asset.name,
+                "type": asset.asset_type,
+                "quantity": asset.quantity,
+                "current_price": asset.current_price,
+                "purchase_price": asset.purchase_price,
+                "current_value": asset.quantity * asset.current_price,
+                "gain_loss": (asset.current_price - asset.purchase_price) * asset.quantity,
+                "gain_loss_percentage": ((asset.current_price - asset.purchase_price) / asset.purchase_price * 100) 
+                    if asset.purchase_price > 0 else 0,
+                "last_updated": asset.last_updated,
+                "needs_update": not asset.last_updated or 
+                    (datetime.utcnow() - asset.last_updated).total_seconds() > 24 * 3600
+            } for asset in assets],
+            "update_status": {
+                "total_assets": len(assets),
+                "assets_needing_update": len(assets_needing_update),
+                "next_update_attempt": (datetime.utcnow() + timedelta(minutes=1)).isoformat() 
+                    if assets_needing_update else None
+            }
+        }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/portfolio/allocation")
 async def get_portfolio_allocation(db: Session = Depends(get_db)):
-    """Get portfolio allocation by asset type"""
+    """Get portfolio allocation by asset type and individual holdings"""
     portfolio = db.query(models.Portfolio).first()
     if not portfolio:
         raise HTTPException(status_code=404, detail="Portfolio not found")
@@ -345,36 +368,56 @@ async def get_portfolio_allocation(db: Session = Depends(get_db)):
     total_value = sum(asset.quantity * asset.current_price for asset in assets)
     
     # Group by asset type
-    allocation = {}
+    type_allocation = {}
     for asset in assets:
         value = asset.quantity * asset.current_price
-        if asset.asset_type not in allocation:
-            allocation[asset.asset_type] = 0
-        allocation[asset.asset_type] += value
+        if asset.asset_type not in type_allocation:
+            type_allocation[asset.asset_type] = 0
+        type_allocation[asset.asset_type] += value
     
-    # Convert to percentages
-    for asset_type in allocation:
-        allocation[asset_type] = (allocation[asset_type] / total_value * 100) if total_value > 0 else 0
+    # Calculate individual asset allocation
+    holdings_allocation = []
+    for asset in assets:
+        value = asset.quantity * asset.current_price
+        percentage = (value / total_value * 100) if total_value > 0 else 0
+        if percentage >= 0.1:  # Only include holdings that are 0.1% or more of the portfolio
+            holdings_allocation.append({
+                "symbol": asset.symbol,
+                "name": asset.name,
+                "value": value,
+                "percentage": percentage
+            })
     
-    return allocation
+    # Sort holdings by percentage in descending order
+    holdings_allocation.sort(key=lambda x: x["percentage"], reverse=True)
+    
+    # Convert type allocation to percentages
+    type_allocation_percentages = {
+        asset_type: (value / total_value * 100) if total_value > 0 else 0
+        for asset_type, value in type_allocation.items()
+    }
+    
+    return {
+        "total_value": total_value,
+        "by_type": type_allocation_percentages,
+        "by_holding": holdings_allocation
+    }
 
 @app.get("/api/stocks/{symbol}")
 async def get_stock_price(symbol: str):
-    """Get current stock price using Alpha Vantage API"""
-    api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="Alpha Vantage API key not configured")
+    """Get current stock price using Polygon.io API"""
+    api_key = os.getenv("POLYGON_API_KEY", "sRu78wED36ZP1bwn8y20GfEj8URDCG5Y")
     
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
+    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?apiKey={api_key}"
     
     try:
         response = requests.get(url)
         data = response.json()
         
-        if "Global Quote" not in data:
+        if data["status"] != "OK" or data["resultsCount"] == 0:
             raise HTTPException(status_code=404, detail="Stock not found")
         
-        price = float(data["Global Quote"]["05. price"])
+        price = float(data["results"][0]["c"])
         return {
             "symbol": symbol,
             "price": price,
@@ -385,17 +428,19 @@ async def get_stock_price(symbol: str):
 
 @app.get("/api/crypto/{symbol}")
 async def get_crypto_price(symbol: str):
-    """Get current cryptocurrency price using CoinGecko API"""
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={symbol}&vs_currencies=usd"
+    """Get current cryptocurrency price using Polygon.io API"""
+    api_key = os.getenv("POLYGON_API_KEY", "sRu78wED36ZP1bwn8y20GfEj8URDCG5Y")
+    
+    url = f"https://api.polygon.io/v2/aggs/ticker/X:{symbol}USD/prev?apiKey={api_key}"
     
     try:
         response = requests.get(url)
         data = response.json()
         
-        if symbol not in data:
+        if data["status"] != "OK" or data["resultsCount"] == 0:
             raise HTTPException(status_code=404, detail="Cryptocurrency not found")
         
-        price = float(data[symbol]["usd"])
+        price = float(data["results"][0]["c"])
         return AssetPrice(
             symbol=symbol,
             price=price,
@@ -406,89 +451,91 @@ async def get_crypto_price(symbol: str):
 
 async def fetch_web_data(symbol: str) -> Dict[str, Any]:
     """Fetch latest news and market data for a given symbol"""
+    print(f"Starting data fetch for {symbol}...")
+    
+    # Initialize results dictionary
+    results = {
+        "market_data": None,
+        "news": None,
+        "analyst_ratings": None
+    }
+    
     async with httpx.AsyncClient() as client:
-        # Fetch from multiple sources concurrently
-        tasks = [
-            fetch_yahoo_finance(client, symbol),
-            fetch_market_news(client, symbol),
-            fetch_analyst_ratings(client, symbol)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Combine results
-        web_data = {
-            "market_data": results[0] if not isinstance(results[0], Exception) else None,
-            "news": results[1] if not isinstance(results[1], Exception) else None,
-            "analyst_ratings": results[2] if not isinstance(results[2], Exception) else None
-        }
-        
-        return web_data
-
-async def fetch_yahoo_finance(client: httpx.AsyncClient, symbol: str) -> Dict[str, Any]:
-    """Fetch market data from Yahoo Finance"""
-    url = f"https://finance.yahoo.com/quote/{quote_plus(symbol)}"
-    try:
-        response = await client.get(url, headers=HEADERS)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html5lib')
+        try:
+            # 1. First fetch market data as it's most critical
+            polygon_key = os.getenv('POLYGON_API_KEY', 'sRu78wED36ZP1bwn8y20GfEj8URDCG5Y')
+            market_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?apiKey={polygon_key}"
             
-            # Extract relevant data (customize based on needs)
-            data = {
-                "price": extract_text(soup, '[data-test="qsp-price"]'),
-                "change": extract_text(soup, '[data-test="qsp-price-change"]'),
-                "market_cap": extract_text(soup, '[data-test="market-cap"]'),
-                "pe_ratio": extract_text(soup, '[data-test="PE_RATIO-value"]'),
-                "volume": extract_text(soup, '[data-test="VOLUME-value"]')
-            }
-            return data
-    except Exception as e:
-        print(f"Error fetching Yahoo Finance data: {e}")
-        return None
-
-async def fetch_market_news(client: httpx.AsyncClient, symbol: str) -> List[Dict[str, str]]:
-    """Fetch latest news articles"""
-    url = f"https://api.marketaux.com/v1/news/all?symbols={symbol}&api_token={os.getenv('MARKETAUX_API_KEY')}"
-    try:
-        response = await client.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("data", [])[:5]  # Return top 5 news articles
-    except Exception as e:
-        print(f"Error fetching news: {e}")
-        return None
-
-async def fetch_analyst_ratings(client: httpx.AsyncClient, symbol: str) -> Dict[str, Any]:
-    """Fetch analyst ratings and price targets"""
-    url = f"https://www.tipranks.com/stocks/{symbol.lower()}/forecast"
-    try:
-        response = await client.get(url, headers=HEADERS)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html5lib')
+            print(f"Fetching market data for {symbol}...")
+            market_response = await client.get(market_url)
             
-            # Extract analyst consensus and price targets
-            data = {
-                "consensus": extract_analyst_consensus(soup),
-                "price_target": extract_price_target(soup)
-            }
-            return data
-    except Exception as e:
-        print(f"Error fetching analyst ratings: {e}")
-        return None
-
-def extract_text(soup: BeautifulSoup, selector: str) -> str:
-    """Helper function to extract text from BeautifulSoup object"""
-    element = soup.select_one(selector)
-    return element.text.strip() if element else None
-
-def extract_analyst_consensus(soup: BeautifulSoup) -> str:
-    """Extract analyst consensus from TipRanks"""
-    consensus_element = soup.find("div", {"data-test": "analyst-consensus"})
-    return consensus_element.text.strip() if consensus_element else None
-
-def extract_price_target(soup: BeautifulSoup) -> str:
-    """Extract price target from TipRanks"""
-    target_element = soup.find("div", {"data-test": "price-target"})
-    return target_element.text.strip() if target_element else None
+            if market_response.status_code == 200:
+                market_json = market_response.json()
+                if market_json.get("status") == "OK" and market_json.get("resultsCount", 0) > 0:
+                    results["market_data"] = {
+                        "price": float(market_json["results"][0]["c"]),
+                        "open": float(market_json["results"][0]["o"]),
+                        "high": float(market_json["results"][0]["h"]),
+                        "low": float(market_json["results"][0]["l"]),
+                        "volume": float(market_json["results"][0]["v"])
+                    }
+                else:
+                    print(f"No market data available for {symbol}: {market_json.get('error')}")
+            
+            # Add delay between API calls
+            await asyncio.sleep(1)
+            
+            # 2. Then fetch news if we have the API key
+            alpha_vantage_key = os.getenv('ALPHA_VANTAGE_API_KEY')
+            if alpha_vantage_key:
+                try:
+                    print(f"Fetching news for {symbol}...")
+                    news_url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={symbol}&apikey={alpha_vantage_key}"
+                    news_response = await client.get(news_url)
+                    
+                    if news_response.status_code == 200:
+                        news_data = news_response.json()
+                        if "feed" in news_data:
+                            results["news"] = []
+                            for article in news_data["feed"][:5]:
+                                results["news"].append({
+                                    "title": article.get("title"),
+                                    "summary": article.get("summary"),
+                                    "url": article.get("url"),
+                                    "sentiment": article.get("overall_sentiment_label"),
+                                    "published_at": article.get("time_published")
+                                })
+                        else:
+                            print(f"No news data available for {symbol}")
+                except Exception as e:
+                    print(f"Error fetching news for {symbol}: {str(e)}")
+            
+            # Add delay between API calls
+            await asyncio.sleep(1)
+            
+            # 3. Finally fetch analyst ratings
+            try:
+                print(f"Fetching analyst ratings for {symbol}...")
+                snapshot_url = f"https://api.polygon.io/v3/snapshot/ticker/{symbol}?apiKey={polygon_key}"
+                snapshot_response = await client.get(snapshot_url)
+                
+                if snapshot_response.status_code == 200:
+                    snapshot_json = snapshot_response.json()
+                    if snapshot_json.get("results"):  # Changed from data to results based on Polygon.io API
+                        data = snapshot_json["results"]
+                        results["analyst_ratings"] = {
+                            "price_target": data.get("price_target", {}).get("average"),
+                            "recommendations": data.get("recommendations", {}).get("summary")
+                        }
+            except Exception as e:
+                print(f"Error fetching analyst ratings for {symbol}: {str(e)}")
+            
+            print(f"Completed data fetch for {symbol}")
+            return results
+            
+        except Exception as e:
+            print(f"Error in fetch_web_data for {symbol}: {str(e)}")
+            return results
 
 async def query_ai_model(prompt: str, context: Dict[str, Any], model: str = None) -> Dict[str, Any]:
     """Query AI model with prompt and context"""
@@ -883,6 +930,119 @@ async def research_query(
     except Exception as e:
         print(f"Error in research query: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/portfolio/recommendations")
+async def get_portfolio_recommendations(db: Session = Depends(get_db)):
+    """Get AI-powered recommendations for portfolio holdings"""
+    try:
+        assets = db.query(models.PortfolioAsset).all()
+        recommendations = []
+        
+        # Process assets in smaller batches to avoid overwhelming APIs
+        BATCH_SIZE = 3
+        for i in range(0, len(assets), BATCH_SIZE):
+            batch = assets[i:i + BATCH_SIZE]
+            
+            for asset in batch:
+                try:
+                    print(f"Processing recommendations for {asset.symbol}...")
+                    # Fetch latest news and market data
+                    web_data = await fetch_web_data(asset.symbol)
+                    
+                    # Prepare context for AI analysis
+                    asset_context = {
+                        "symbol": asset.symbol,
+                        "name": asset.name,
+                        "type": asset.asset_type,
+                        "current_price": asset.current_price,
+                        "market_data": web_data.get("market_data"),
+                        "news": web_data.get("news"),
+                        "analyst_ratings": web_data.get("analyst_ratings")
+                    }
+                    
+                    recommendation = {
+                        "symbol": asset.symbol,
+                        "name": asset.name,
+                        "value": asset.quantity * asset.current_price,
+                        "market_data": web_data.get("market_data"),
+                        "news": web_data.get("news", [])[:3] if web_data.get("news") else [],
+                        "analyst_ratings": web_data.get("analyst_ratings"),
+                        "last_updated": datetime.now(timezone.utc).isoformat()  # Use timezone-aware datetime
+                    }
+                    
+                    # Only proceed with AI analysis if we have some data to work with
+                    if web_data.get("market_data") or web_data.get("news") or web_data.get("analyst_ratings"):
+                        print(f"Querying AI for {asset.symbol}...")
+                        
+                        # Construct prompt based on available data
+                        prompt_parts = [f"Analyze {asset.symbol} ({asset.name}) based on the following data:"]
+                        
+                        if web_data.get("market_data"):
+                            market_data = web_data["market_data"]
+                            prompt_parts.append(f"""
+                            Market Data:
+                            - Current Price: ${market_data['price']}
+                            - Today's Range: ${market_data['low']} - ${market_data['high']}
+                            - Volume: {market_data['volume']}""")
+                        
+                        if web_data.get("news"):
+                            prompt_parts.append(f"News Headlines: {len(web_data['news'])} recent articles")
+                        
+                        if web_data.get("analyst_ratings", {}).get("price_target"):
+                            prompt_parts.append(f"Analyst Ratings: Price Target ${web_data['analyst_ratings']['price_target']}")
+                        
+                        prompt_parts.append("""
+                        Provide a concise recommendation with:
+                        1. Overall sentiment (bullish/neutral/bearish)
+                        2. Key factors influencing the recommendation
+                        3. Suggested action (hold/watch/research)
+                        4. Risk level (low/medium/high)""")
+                        
+                        prompt = "\n".join(prompt_parts)
+                        ai_response = await query_ai_model(prompt, asset_context)
+                        recommendation["analysis"] = ai_response["answer"]
+                    else:
+                        recommendation["analysis"] = "Insufficient data available for AI analysis. Please try again later."
+                        recommendation["error"] = "No market data or news available"
+                    
+                    recommendations.append(recommendation)
+                    
+                except Exception as e:
+                    print(f"Error analyzing {asset.symbol}: {str(e)}")
+                    recommendations.append({
+                        "symbol": asset.symbol,
+                        "name": asset.name,
+                        "value": asset.quantity * asset.current_price,
+                        "analysis": "Error generating recommendations. Please try again later.",
+                        "error": str(e),
+                        "last_updated": datetime.now(timezone.utc).isoformat()
+                    })
+                
+                # Add delay between processing assets
+                await asyncio.sleep(2)
+            
+            # Add longer delay between batches
+            if i + BATCH_SIZE < len(assets):
+                print("Waiting between batches to respect API rate limits...")
+                await asyncio.sleep(5)
+        
+        return {
+            "recommendations": recommendations,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "status": "completed",
+            "error_count": len([r for r in recommendations if "error" in r])
+        }
+        
+    except Exception as e:
+        print(f"Error in get_portfolio_recommendations: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": str(e),
+                "message": "Error generating portfolio recommendations",
+                "status": "failed"
+            }
+        )
 
 if __name__ == "__main__":
     import uvicorn

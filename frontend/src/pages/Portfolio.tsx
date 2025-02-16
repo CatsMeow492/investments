@@ -34,6 +34,16 @@ interface Asset {
   gain_loss: number;
   gain_loss_percentage: number;
   last_updated: string;
+  needs_update: boolean;
+}
+
+interface PortfolioResponse {
+  assets: Asset[];
+  update_status: {
+    total_assets: number;
+    assets_needing_update: number;
+    next_update_attempt: string | null;
+  };
 }
 
 const Portfolio: React.FC = () => {
@@ -43,15 +53,36 @@ const Portfolio: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const [nextUpdate, setNextUpdate] = useState<Date | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<{
+    total_assets: number;
+    assets_needing_update: number;
+    next_update_attempt: string | null;
+  } | null>(null);
 
   const fetchAssets = async () => {
     try {
-      setLoading(true);
-      const response = await axios.get('http://localhost:8000/api/portfolio/assets');
-      setAssets(response.data);
+      // Only show loading on initial fetch
+      if (!assets.length) {
+        setLoading(true);
+      }
+      const response = await axios.get<PortfolioResponse>('http://localhost:8000/api/portfolio/assets');
+      
+      // Create a Map to ensure uniqueness by symbol
+      const uniqueAssets = new Map(
+        response.data.assets.map(asset => [asset.symbol, asset])
+      );
+      
+      setAssets(Array.from(uniqueAssets.values()));
+      setUpdateStatus(response.data.update_status);
       setLastUpdate(new Date());
+      
+      if (response.data.update_status.next_update_attempt) {
+        setNextUpdate(new Date(response.data.update_status.next_update_attempt));
+      }
+      setError(null); // Clear any previous errors
     } catch (err) {
       setError('Failed to fetch portfolio assets');
       console.error('Error fetching assets:', err);
@@ -73,6 +104,11 @@ const Portfolio: React.FC = () => {
         ).join(', ');
         setRefreshError(`Failed to update some prices: ${failedSymbols}`);
       }
+
+      // Set next update time
+      if (response.data.cache_info && response.data.cache_info.next_update) {
+        setNextUpdate(new Date(response.data.cache_info.next_update));
+      }
       
       await fetchAssets();
     } catch (err) {
@@ -85,10 +121,14 @@ const Portfolio: React.FC = () => {
 
   useEffect(() => {
     fetchAssets();
-    // Refresh data every minute
-    const interval = setInterval(fetchAssets, 60000);
+    // Refresh data every minute if there are assets needing updates
+    const interval = setInterval(() => {
+      if (updateStatus && updateStatus.assets_needing_update > 0) {
+        fetchAssets();
+      }
+    }, 60000);
     return () => clearInterval(interval);
-  }, []);
+  }, [updateStatus?.assets_needing_update]);
 
   const handleAddClick = () => {
     setSelectedAsset(null);
@@ -110,7 +150,8 @@ const Portfolio: React.FC = () => {
     setSelectedAsset(null);
   };
 
-  if (loading) {
+  // Only show loading screen on initial load
+  if (loading && !assets.length) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
         <CircularProgress />
@@ -134,8 +175,14 @@ const Portfolio: React.FC = () => {
             <Box>
               <Typography variant="h5">My Investments</Typography>
               {lastUpdate && (
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" color="text.secondary" display="block">
                   Last updated: {lastUpdate.toLocaleTimeString()}
+                </Typography>
+              )}
+              {updateStatus && updateStatus.assets_needing_update > 0 && (
+                <Typography variant="caption" color="warning.main" display="block">
+                  {updateStatus.assets_needing_update} assets waiting for price updates
+                  {nextUpdate && ` (next attempt: ${nextUpdate.toLocaleTimeString()})`}
                 </Typography>
               )}
               {refreshError && (
@@ -148,10 +195,13 @@ const Portfolio: React.FC = () => {
               <Button
                 variant="outlined"
                 onClick={handleRefresh}
-                disabled={refreshing}
+                disabled={refreshing || (nextUpdate ? new Date() < nextUpdate : false)}
                 startIcon={<CircularProgress size={16} sx={{ display: refreshing ? 'inline-flex' : 'none' }} />}
               >
-                Refresh Prices
+                {nextUpdate && new Date() < nextUpdate 
+                  ? `Update Available in ${Math.ceil((nextUpdate.getTime() - new Date().getTime()) / (1000 * 60))} minutes`
+                  : 'Refresh Prices'
+                }
               </Button>
               <Button
                 variant="contained"
@@ -181,7 +231,10 @@ const Portfolio: React.FC = () => {
               </TableHead>
               <TableBody>
                 {assets.map((asset) => (
-                  <TableRow key={asset.symbol}>
+                  <TableRow 
+                    key={asset.symbol}
+                    sx={asset.needs_update ? { backgroundColor: 'action.hover' } : undefined}
+                  >
                     <TableCell>{asset.symbol}</TableCell>
                     <TableCell>{asset.name}</TableCell>
                     <TableCell>{asset.type}</TableCell>
@@ -189,8 +242,15 @@ const Portfolio: React.FC = () => {
                     <TableCell align="right">${asset.purchase_price.toFixed(2)}</TableCell>
                     <TableCell align="right">
                       ${asset.current_price.toFixed(2)}
-                      <Typography variant="caption" display="block" color="text.secondary">
-                        {new Date(asset.last_updated).toLocaleTimeString()}
+                      <Typography 
+                        variant="caption" 
+                        display="block" 
+                        color={asset.needs_update ? "warning.main" : "text.secondary"}
+                      >
+                        {asset.needs_update 
+                          ? "Update pending..."
+                          : new Date(asset.last_updated).toLocaleTimeString()
+                        }
                       </Typography>
                     </TableCell>
                     <TableCell align="right">${asset.current_value.toFixed(2)}</TableCell>
