@@ -166,7 +166,7 @@ const Research: React.FC = () => {
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        const response = await axios.get('http://localhost:8000/api/models');
+        const response = await axios.get('http://localhost:8000/api/research/models');
         setModels(response.data);
         // Set first available model as default
         const availableModel = response.data.find((m: ModelInfo) => m.is_available);

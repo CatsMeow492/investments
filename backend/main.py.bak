@@ -16,6 +16,9 @@ import json
 import asyncio
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
+import redis.asyncio as redis
+import pickle
+from functools import wraps
 
 # Load environment variables
 load_dotenv()
@@ -41,7 +44,7 @@ app = FastAPI(title="Investment Portfolio Tracker API")
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Add all frontend URLs
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -190,6 +193,87 @@ MODEL_CONFIGS = {
     }
 }
 
+class PolygonRateLimiter:
+    def __init__(self, calls_per_minute=5):
+        self.calls_per_minute = calls_per_minute
+        self.calls = []
+        self.lock = asyncio.Lock()
+    
+    async def wait_if_needed(self):
+        async with self.lock:
+            current_time = datetime.now(timezone.utc)
+            # Remove calls older than 1 minute
+            self.calls = [call_time for call_time in self.calls 
+                         if (current_time - call_time).total_seconds() < 60]
+            
+            if len(self.calls) >= self.calls_per_minute:
+                # Wait until the oldest call is more than 1 minute old
+                wait_time = 60 - (current_time - self.calls[0]).total_seconds()
+                if wait_time > 0:
+                    print(f"Rate limit reached, waiting {wait_time:.1f} seconds...")
+                    await asyncio.sleep(wait_time)
+                self.calls = self.calls[1:]  # Remove the oldest call
+            
+            self.calls.append(current_time)
+
+# Create a global rate limiter instance
+polygon_rate_limiter = PolygonRateLimiter(calls_per_minute=30)  # Increase from 5 to 30 calls per minute
+
+# Redis Configuration
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_client = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=False)
+
+# Cache TTL Configuration (in seconds)
+CACHE_TTL = {
+    "market_data": 24 * 60 * 60,  # 24 hours for market data
+    "news": 12 * 60 * 60,         # 12 hours for news
+    "analyst_ratings": 7 * 24 * 60 * 60,  # 7 days for analyst ratings
+    "portfolio_recommendations": 24 * 60 * 60,  # 24 hours for portfolio recommendations
+}
+
+async def get_cached_data(key: str, cache_type: str) -> Optional[Dict]:
+    """Get data from cache if available"""
+    try:
+        cached_data = await redis_client.get(key)
+        if cached_data:
+            data = pickle.loads(cached_data)
+            # Check if the cached data includes a timestamp and is still valid
+            if isinstance(data, dict) and "timestamp" in data:
+                age = (datetime.now(timezone.utc) - data["timestamp"]).total_seconds()
+                if age < CACHE_TTL[cache_type]:
+                    print(f"Cache hit for {key}")
+                    return data["data"]
+            await redis_client.delete(key)  # Delete expired cache
+    except Exception as e:
+        print(f"Cache error for {key}: {str(e)}")
+    return None
+
+async def set_cached_data(key: str, data: Any, cache_type: str):
+    """Store data in cache with timestamp"""
+    try:
+        cache_data = {
+            "timestamp": datetime.now(timezone.utc),
+            "data": data
+        }
+        await redis_client.setex(
+            key,
+            CACHE_TTL[cache_type],
+            pickle.dumps(cache_data)
+        )
+    except Exception as e:
+        print(f"Cache set error for {key}: {str(e)}")
+
+# Create startup and shutdown events for Redis
+@app.on_event("startup")
+async def startup_event():
+    # Initialize Redis connection
+    await redis_client.ping()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    # Close Redis connection
+    await redis_client.close()
+
 # Routes
 @app.get("/")
 async def read_root():
@@ -311,23 +395,28 @@ async def update_portfolio_prices(db: Session = Depends(get_db)):
 
 @app.get("/api/portfolio/assets")
 async def get_portfolio_assets(db: Session = Depends(get_db)):
-    """Get all assets in the portfolio with current values and gain/loss calculations"""
+    """Get all assets in the portfolio"""
     try:
-        assets = db.query(models.PortfolioAsset).all()
+        # Try to get from cache first
+        cache_key = "portfolio_assets"
+        cached_assets = await get_cached_data(cache_key, "market_data")
         
-        # Check if prices need updating (older than 24 hours)
-        assets_needing_update = [
-            asset for asset in assets
-            if not asset.last_updated or 
-            (datetime.utcnow() - asset.last_updated).total_seconds() > 24 * 3600
-        ]
+        if cached_assets:
+            print("Using cached portfolio assets")
+            return cached_assets
         
-        # Start update in background if needed, but don't wait for it
-        if assets_needing_update:
-            background_tasks = BackgroundTasks()
-            background_tasks.add_task(update_portfolio_prices, db)
+        portfolio = db.query(models.Portfolio).first()
+        if not portfolio:
+            raise HTTPException(status_code=404, detail="Portfolio not found")
         
-        return {
+        assets = db.query(models.PortfolioAsset).filter(
+            models.PortfolioAsset.portfolio_id == portfolio.id
+        ).all()
+        
+        current_time = datetime.now(timezone.utc)
+        next_update = current_time + timedelta(hours=24)  # Schedule next update in 24 hours
+        
+        response_data = {
             "assets": [{
                 "symbol": asset.symbol,
                 "name": asset.name,
@@ -336,23 +425,27 @@ async def get_portfolio_assets(db: Session = Depends(get_db)):
                 "current_price": asset.current_price,
                 "purchase_price": asset.purchase_price,
                 "current_value": asset.quantity * asset.current_price,
+                "purchase_value": asset.quantity * asset.purchase_price,
                 "gain_loss": (asset.current_price - asset.purchase_price) * asset.quantity,
                 "gain_loss_percentage": ((asset.current_price - asset.purchase_price) / asset.purchase_price * 100) 
                     if asset.purchase_price > 0 else 0,
-                "last_updated": asset.last_updated,
-                "needs_update": not asset.last_updated or 
-                    (datetime.utcnow() - asset.last_updated).total_seconds() > 24 * 3600
+                "last_updated": asset.last_updated.isoformat() if asset.last_updated else None
             } for asset in assets],
-            "update_status": {
-                "total_assets": len(assets),
-                "assets_needing_update": len(assets_needing_update),
-                "next_update_attempt": (datetime.utcnow() + timedelta(minutes=1)).isoformat() 
-                    if assets_needing_update else None
-            }
+            "last_updated": current_time.isoformat(),
+            "next_update_attempt": next_update.isoformat()
         }
         
+        # Cache the response
+        await set_cached_data(cache_key, response_data, "market_data")
+        
+        return response_data
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in get_portfolio_assets: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 @app.get("/api/portfolio/allocation")
 async def get_portfolio_allocation(db: Session = Depends(get_db)):
@@ -450,7 +543,7 @@ async def get_crypto_price(symbol: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 async def fetch_web_data(symbol: str) -> Dict[str, Any]:
-    """Fetch latest news and market data for a given symbol"""
+    """Fetch latest news and market data for a given symbol with caching"""
     print(f"Starting data fetch for {symbol}...")
     
     # Initialize results dictionary
@@ -460,75 +553,112 @@ async def fetch_web_data(symbol: str) -> Dict[str, Any]:
         "analyst_ratings": None
     }
     
+    # Get API keys once at the start
+    polygon_key = os.getenv('POLYGON_API_KEY', 'sRu78wED36ZP1bwn8y20GfEj8URDCG5Y')
+    alpha_vantage_key = os.getenv('ALPHA_VANTAGE_API_KEY')
+    
     async with httpx.AsyncClient() as client:
         try:
-            # 1. First fetch market data as it's most critical
-            polygon_key = os.getenv('POLYGON_API_KEY', 'sRu78wED36ZP1bwn8y20GfEj8URDCG5Y')
-            market_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?apiKey={polygon_key}"
+            # 1. Try to get market data from cache first
+            cache_key = f"market_data:{symbol}"
+            cached_market_data = await get_cached_data(cache_key, "market_data")
             
-            print(f"Fetching market data for {symbol}...")
-            market_response = await client.get(market_url)
-            
-            if market_response.status_code == 200:
-                market_json = market_response.json()
-                if market_json.get("status") == "OK" and market_json.get("resultsCount", 0) > 0:
-                    results["market_data"] = {
-                        "price": float(market_json["results"][0]["c"]),
-                        "open": float(market_json["results"][0]["o"]),
-                        "high": float(market_json["results"][0]["h"]),
-                        "low": float(market_json["results"][0]["l"]),
-                        "volume": float(market_json["results"][0]["v"])
-                    }
-                else:
-                    print(f"No market data available for {symbol}: {market_json.get('error')}")
-            
-            # Add delay between API calls
-            await asyncio.sleep(1)
-            
-            # 2. Then fetch news if we have the API key
-            alpha_vantage_key = os.getenv('ALPHA_VANTAGE_API_KEY')
-            if alpha_vantage_key:
-                try:
-                    print(f"Fetching news for {symbol}...")
-                    news_url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={symbol}&apikey={alpha_vantage_key}"
-                    news_response = await client.get(news_url)
-                    
-                    if news_response.status_code == 200:
-                        news_data = news_response.json()
-                        if "feed" in news_data:
-                            results["news"] = []
-                            for article in news_data["feed"][:5]:
-                                results["news"].append({
-                                    "title": article.get("title"),
-                                    "summary": article.get("summary"),
-                                    "url": article.get("url"),
-                                    "sentiment": article.get("overall_sentiment_label"),
-                                    "published_at": article.get("time_published")
-                                })
-                        else:
-                            print(f"No news data available for {symbol}")
-                except Exception as e:
-                    print(f"Error fetching news for {symbol}: {str(e)}")
-            
-            # Add delay between API calls
-            await asyncio.sleep(1)
-            
-            # 3. Finally fetch analyst ratings
-            try:
-                print(f"Fetching analyst ratings for {symbol}...")
-                snapshot_url = f"https://api.polygon.io/v3/snapshot/ticker/{symbol}?apiKey={polygon_key}"
-                snapshot_response = await client.get(snapshot_url)
+            if cached_market_data:
+                results["market_data"] = cached_market_data
+                print(f"Using cached market data for {symbol}")
+            else:
+                # Fetch fresh market data
+                await polygon_rate_limiter.wait_if_needed()
                 
-                if snapshot_response.status_code == 200:
-                    snapshot_json = snapshot_response.json()
-                    if snapshot_json.get("results"):  # Changed from data to results based on Polygon.io API
-                        data = snapshot_json["results"]
-                        results["analyst_ratings"] = {
-                            "price_target": data.get("price_target", {}).get("average"),
-                            "recommendations": data.get("recommendations", {}).get("summary")
+                market_url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev?apiKey={polygon_key}"
+                print(f"Fetching market data for {symbol}...")
+                market_response = await client.get(market_url)
+                
+                if market_response.status_code == 200:
+                    market_json = market_response.json()
+                    if market_json.get("status") == "OK" and market_json.get("resultsCount", 0) > 0:
+                        market_data = {
+                            "price": float(market_json["results"][0]["c"]),
+                            "open": float(market_json["results"][0]["o"]),
+                            "high": float(market_json["results"][0]["h"]),
+                            "low": float(market_json["results"][0]["l"]),
+                            "volume": float(market_json["results"][0]["v"])
                         }
-            except Exception as e:
-                print(f"Error fetching analyst ratings for {symbol}: {str(e)}")
+                        results["market_data"] = market_data
+                        await set_cached_data(cache_key, market_data, "market_data")
+                    else:
+                        print(f"No market data available for {symbol}: {market_json.get('error')}")
+                elif market_response.status_code == 429:
+                    print(f"Rate limit exceeded for {symbol}, using cached data if available...")
+                    if cached_market_data:
+                        results["market_data"] = cached_market_data
+            
+            # 2. Try to get news from cache
+            news_cache_key = f"news:{symbol}"
+            cached_news = await get_cached_data(news_cache_key, "news")
+            
+            if cached_news:
+                results["news"] = cached_news
+                print(f"Using cached news for {symbol}")
+            else:
+                # Fetch fresh news
+                if alpha_vantage_key:
+                    try:
+                        print(f"Fetching news for {symbol}...")
+                        news_url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={symbol}&apikey={alpha_vantage_key}"
+                        news_response = await client.get(news_url)
+                        
+                        if news_response.status_code == 200:
+                            news_data = news_response.json()
+                            if "feed" in news_data:
+                                news = []
+                                for article in news_data["feed"][:5]:
+                                    news.append({
+                                        "title": article.get("title"),
+                                        "summary": article.get("summary"),
+                                        "url": article.get("url"),
+                                        "sentiment": article.get("overall_sentiment_label"),
+                                        "published_at": article.get("time_published")
+                                    })
+                                results["news"] = news
+                                await set_cached_data(news_cache_key, news, "news")
+                            else:
+                                print(f"No news data available for {symbol}")
+                    except Exception as e:
+                        print(f"Error fetching news for {symbol}: {str(e)}")
+            
+            # 3. Try to get analyst ratings from cache
+            if results["market_data"]:
+                ratings_cache_key = f"analyst_ratings:{symbol}"
+                cached_ratings = await get_cached_data(ratings_cache_key, "analyst_ratings")
+                
+                if cached_ratings:
+                    results["analyst_ratings"] = cached_ratings
+                    print(f"Using cached analyst ratings for {symbol}")
+                else:
+                    try:
+                        print(f"Fetching analyst ratings for {symbol}...")
+                        await polygon_rate_limiter.wait_if_needed()
+                        
+                        snapshot_url = f"https://api.polygon.io/v3/snapshot/ticker/{symbol}?apiKey={polygon_key}"
+                        snapshot_response = await client.get(snapshot_url)
+                        
+                        if snapshot_response.status_code == 200:
+                            snapshot_json = snapshot_response.json()
+                            if snapshot_json.get("results"):
+                                data = snapshot_json["results"]
+                                ratings = {
+                                    "price_target": data.get("price_target", {}).get("average"),
+                                    "recommendations": data.get("recommendations", {}).get("summary")
+                                }
+                                results["analyst_ratings"] = ratings
+                                await set_cached_data(ratings_cache_key, ratings, "analyst_ratings")
+                        elif snapshot_response.status_code == 429:
+                            print(f"Rate limit exceeded for analyst ratings, using cached data if available...")
+                            if cached_ratings:
+                                results["analyst_ratings"] = cached_ratings
+                    except Exception as e:
+                        print(f"Error fetching analyst ratings for {symbol}: {str(e)}")
             
             print(f"Completed data fetch for {symbol}")
             return results
@@ -933,80 +1063,32 @@ async def research_query(
 
 @app.get("/api/portfolio/recommendations")
 async def get_portfolio_recommendations(db: Session = Depends(get_db)):
-    """Get AI-powered recommendations for portfolio holdings"""
+    """Get AI-powered recommendations for portfolio holdings with caching"""
     try:
+        # Try to get recommendations from cache first
+        cache_key = "portfolio_recommendations"
+        cached_recommendations = await get_cached_data(cache_key, "portfolio_recommendations")
+        
+        if cached_recommendations:
+            print("Using cached portfolio recommendations")
+            return cached_recommendations
+        
         assets = db.query(models.PortfolioAsset).all()
         recommendations = []
         
         # Process assets in smaller batches to avoid overwhelming APIs
-        BATCH_SIZE = 3
+        BATCH_SIZE = 3  # Process 3 assets at a time
         for i in range(0, len(assets), BATCH_SIZE):
             batch = assets[i:i + BATCH_SIZE]
             
             for asset in batch:
                 try:
                     print(f"Processing recommendations for {asset.symbol}...")
-                    # Fetch latest news and market data
                     web_data = await fetch_web_data(asset.symbol)
                     
-                    # Prepare context for AI analysis
-                    asset_context = {
-                        "symbol": asset.symbol,
-                        "name": asset.name,
-                        "type": asset.asset_type,
-                        "current_price": asset.current_price,
-                        "market_data": web_data.get("market_data"),
-                        "news": web_data.get("news"),
-                        "analyst_ratings": web_data.get("analyst_ratings")
-                    }
-                    
-                    recommendation = {
-                        "symbol": asset.symbol,
-                        "name": asset.name,
-                        "value": asset.quantity * asset.current_price,
-                        "market_data": web_data.get("market_data"),
-                        "news": web_data.get("news", [])[:3] if web_data.get("news") else [],
-                        "analyst_ratings": web_data.get("analyst_ratings"),
-                        "last_updated": datetime.now(timezone.utc).isoformat()  # Use timezone-aware datetime
-                    }
-                    
-                    # Only proceed with AI analysis if we have some data to work with
-                    if web_data.get("market_data") or web_data.get("news") or web_data.get("analyst_ratings"):
-                        print(f"Querying AI for {asset.symbol}...")
-                        
-                        # Construct prompt based on available data
-                        prompt_parts = [f"Analyze {asset.symbol} ({asset.name}) based on the following data:"]
-                        
-                        if web_data.get("market_data"):
-                            market_data = web_data["market_data"]
-                            prompt_parts.append(f"""
-                            Market Data:
-                            - Current Price: ${market_data['price']}
-                            - Today's Range: ${market_data['low']} - ${market_data['high']}
-                            - Volume: {market_data['volume']}""")
-                        
-                        if web_data.get("news"):
-                            prompt_parts.append(f"News Headlines: {len(web_data['news'])} recent articles")
-                        
-                        if web_data.get("analyst_ratings", {}).get("price_target"):
-                            prompt_parts.append(f"Analyst Ratings: Price Target ${web_data['analyst_ratings']['price_target']}")
-                        
-                        prompt_parts.append("""
-                        Provide a concise recommendation with:
-                        1. Overall sentiment (bullish/neutral/bearish)
-                        2. Key factors influencing the recommendation
-                        3. Suggested action (hold/watch/research)
-                        4. Risk level (low/medium/high)""")
-                        
-                        prompt = "\n".join(prompt_parts)
-                        ai_response = await query_ai_model(prompt, asset_context)
-                        recommendation["analysis"] = ai_response["answer"]
-                    else:
-                        recommendation["analysis"] = "Insufficient data available for AI analysis. Please try again later."
-                        recommendation["error"] = "No market data or news available"
-                    
-                    recommendations.append(recommendation)
-                    
+                    # Add a smaller delay between individual asset processing
+                    await asyncio.sleep(1)  # Reduced from 2 seconds to 1 second
+    
                 except Exception as e:
                     print(f"Error analyzing {asset.symbol}: {str(e)}")
                     recommendations.append({
@@ -1018,20 +1100,22 @@ async def get_portfolio_recommendations(db: Session = Depends(get_db)):
                         "last_updated": datetime.now(timezone.utc).isoformat()
                     })
                 
-                # Add delay between processing assets
-                await asyncio.sleep(2)
-            
-            # Add longer delay between batches
+            # Add a smaller delay between batches
             if i + BATCH_SIZE < len(assets):
                 print("Waiting between batches to respect API rate limits...")
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)  # Reduced from 5 seconds to 3 seconds
         
-        return {
+        response_data = {
             "recommendations": recommendations,
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "status": "completed",
             "error_count": len([r for r in recommendations if "error" in r])
         }
+        
+        # Cache the recommendations
+        await set_cached_data(cache_key, response_data, "portfolio_recommendations")
+        
+        return response_data
         
     except Exception as e:
         print(f"Error in get_portfolio_recommendations: {str(e)}")
