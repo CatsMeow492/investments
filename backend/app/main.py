@@ -4,6 +4,7 @@ from .core.config import settings
 from .core.cache import connect_to_redis, close_redis
 from .api import portfolio, research
 from database import create_tables
+from .services.market_data import cleanup as cleanup_market_data
 
 # Create FastAPI app
 app = FastAPI(title="Investment Portfolio Tracker API")
@@ -28,6 +29,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     await close_redis()
+    await cleanup_market_data()
 
 # Import and include routers
 app.include_router(portfolio.router, prefix="/api/portfolio", tags=["portfolio"])

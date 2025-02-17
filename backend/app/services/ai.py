@@ -3,6 +3,11 @@ import json
 from typing import Dict, Any, AsyncGenerator, List, Optional
 from ..core.config import settings
 from ..models.portfolio import ModelInfo
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class AIModel:
     OPENAI = "openai"
@@ -46,6 +51,8 @@ class AIModel:
                 is_available=bool(settings.ANTHROPIC_API_KEY)
             )
         ]
+        available_models = [model for model in models if model.is_available]
+        logger.info(f"Available AI models: {[model.name for model in available_models]}")
         return models
 
 # OpenRouter base configuration
@@ -108,11 +115,14 @@ async def query_ai_model(prompt: str, context: Dict[str, Any], model: str = None
     if not model:
         model = DEFAULT_MODEL
         if not model:
+            logger.error("No AI model API keys configured")
             raise ValueError("No AI model API keys configured")
 
     if model not in MODEL_CONFIGS:
+        logger.error(f"Unsupported model: {model}")
         raise ValueError(f"Unsupported model: {model}")
 
+    logger.info(f"Querying {model} for analysis")
     config = MODEL_CONFIGS[model]
     
     # Handle API key validation based on model type
@@ -123,6 +133,7 @@ async def query_ai_model(prompt: str, context: Dict[str, Any], model: str = None
         api_key = getattr(settings, f"{model.upper()}_API_KEY")
     
     if not api_key:
+        logger.error(f"{model} API key not configured")
         raise ValueError(f"{model} API key not configured")
 
     headers = {
@@ -140,7 +151,7 @@ async def query_ai_model(prompt: str, context: Dict[str, Any], model: str = None
         headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2024-01-01"
 
-    # Prepare the system message
+    logger.info(f"Preparing request for {model}")
     system_message = """You are an AI investment research assistant. Analyze the provided portfolio and market data to give informed insights and recommendations. Base your analysis on:
 1. Portfolio composition and performance
 2. Market conditions and trends
@@ -148,23 +159,13 @@ async def query_ai_model(prompt: str, context: Dict[str, Any], model: str = None
 4. Latest news and analyst opinions
 Always provide specific, data-backed insights and clear reasoning for your recommendations."""
 
-    # Format context
-    formatted_context = {
-        "query_type": "portfolio" if context.get("portfolio") else "asset",
-        "portfolio_summary": context.get("portfolio", {}).get("summary") if context.get("portfolio") else None,
-        "asset_details": context.get("asset") if context.get("asset") else None,
-        "market_data": context.get("web_data", {}).get("market_data") if context.get("web_data") else None,
-        "latest_news": context.get("web_data", {}).get("news") if context.get("web_data") else None,
-        "analyst_ratings": context.get("web_data", {}).get("analyst_ratings") if context.get("web_data") else None
-    }
-
     try:
         async with httpx.AsyncClient(timeout=settings.MODEL_TIMEOUT) as client:
             # Prepare request based on model
             if model in [AIModel.OPENAI, AIModel.OPENROUTER_CLAUDE, AIModel.OPENROUTER_MISTRAL, AIModel.OPENROUTER_DEEPSEEK]:
                 messages = [
                     {"role": "system", "content": system_message},
-                    {"role": "user", "content": f"Context: {json.dumps(formatted_context, indent=2)}\n\nQuery: {prompt}"}
+                    {"role": "user", "content": f"Context: {json.dumps(context, indent=2)}\n\nQuery: {prompt}"}
                 ]
                 request_data = {
                     "model": config["model"],
@@ -177,11 +178,12 @@ Always provide specific, data-backed insights and clear reasoning for your recom
                     "model": config["model"],
                     "messages": [{
                         "role": "user",
-                        "content": f"{system_message}\n\nContext: {json.dumps(formatted_context, indent=2)}\n\nQuery: {prompt}"
+                        "content": f"{system_message}\n\nContext: {json.dumps(context, indent=2)}\n\nQuery: {prompt}"
                     }],
                     "max_tokens": config["max_tokens"]
                 }
 
+            logger.info(f"Sending request to {model}")
             response = await client.post(
                 config["api_url"],
                 headers=headers,
@@ -190,6 +192,7 @@ Always provide specific, data-backed insights and clear reasoning for your recom
             
             if response.status_code == 200:
                 result = response.json()
+                logger.info(f"Received successful response from {model}")
                 
                 # Extract content based on model
                 if model in [AIModel.OPENAI, AIModel.OPENROUTER_CLAUDE, AIModel.OPENROUTER_MISTRAL, AIModel.OPENROUTER_DEEPSEEK]:
@@ -197,16 +200,19 @@ Always provide specific, data-backed insights and clear reasoning for your recom
                 elif model == AIModel.ANTHROPIC:
                     content = result["messages"][0]["content"][0]["text"]
                 
+                logger.info(f"Successfully extracted content from {model} response")
                 return {
                     "answer": content,
-                    "sources": formatted_context,
+                    "sources": context,
                     "model_used": config["model"]
                 }
             else:
                 error_message = response.text
+                logger.error(f"{model} API error: {error_message}")
                 raise ValueError(f"{model} API error: {error_message}")
                 
     except Exception as e:
+        logger.error(f"Error querying {model}: {str(e)}", exc_info=True)
         raise ValueError(f"Error querying {model}: {str(e)}")
 
 async def stream_ai_response(prompt: str, context: Dict[str, Any], model: str = None) -> AsyncGenerator[str, None]:

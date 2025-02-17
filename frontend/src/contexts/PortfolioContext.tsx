@@ -120,6 +120,13 @@ const setCachedData = <T,>(key: string, data: T, expiry: number) => {
 };
 
 export const PortfolioProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  // Clear localStorage cache on mount
+  useEffect(() => {
+    Object.values(CACHE_KEYS).forEach(key => {
+      localStorage.removeItem(key);
+    });
+  }, []);
+
   const [assets, setAssets] = useState<Asset[]>([]);
   const [summary, setSummary] = useState<PortfolioSummary | null>(null);
   const [allocation, setAllocation] = useState<AssetAllocation | null>(null);
@@ -141,17 +148,8 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const fetchAssets = useCallback(async () => {
     try {
-      // Check cache first
-      const cachedAssets = getCachedData<Asset[]>(CACHE_KEYS.ASSETS);
-      if (cachedAssets) {
-        setAssets(cachedAssets);
-        setLoading(prev => ({ ...prev, assets: false }));
-        return;
-      }
-
       const response = await axios.get('http://localhost:8000/api/portfolio/assets');
       setAssets(response.data.assets);
-      setCachedData(CACHE_KEYS.ASSETS, response.data.assets, CACHE_EXPIRY.ASSETS);
       setLastUpdate(new Date());
       
       if (response.data.update_status.next_update_attempt) {
@@ -169,16 +167,8 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const fetchSummary = useCallback(async () => {
     try {
-      const cachedSummary = getCachedData<PortfolioSummary>(CACHE_KEYS.SUMMARY);
-      if (cachedSummary) {
-        setSummary(cachedSummary);
-        setLoading(prev => ({ ...prev, summary: false }));
-        return;
-      }
-
       const response = await axios.get('http://localhost:8000/api/portfolio/summary');
       setSummary(response.data);
-      setCachedData(CACHE_KEYS.SUMMARY, response.data, CACHE_EXPIRY.SUMMARY);
       setErrors(prev => ({ ...prev, summary: null }));
     } catch (err) {
       setErrors(prev => ({ ...prev, summary: 'Failed to fetch portfolio summary' }));
@@ -190,16 +180,8 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const fetchAllocation = useCallback(async () => {
     try {
-      const cachedAllocation = getCachedData<AssetAllocation>(CACHE_KEYS.ALLOCATION);
-      if (cachedAllocation) {
-        setAllocation(cachedAllocation);
-        setLoading(prev => ({ ...prev, allocation: false }));
-        return;
-      }
-
       const response = await axios.get('http://localhost:8000/api/portfolio/allocation');
       setAllocation(response.data);
-      setCachedData(CACHE_KEYS.ALLOCATION, response.data, CACHE_EXPIRY.ALLOCATION);
       setErrors(prev => ({ ...prev, allocation: null }));
     } catch (err) {
       setErrors(prev => ({ ...prev, allocation: 'Failed to fetch portfolio allocation' }));
@@ -211,16 +193,8 @@ export const PortfolioProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const fetchRecommendations = useCallback(async () => {
     try {
-      const cachedRecommendations = getCachedData<Recommendation[]>(CACHE_KEYS.RECOMMENDATIONS);
-      if (cachedRecommendations) {
-        setRecommendations(cachedRecommendations);
-        setLoading(prev => ({ ...prev, recommendations: false }));
-        return;
-      }
-
       const response = await axios.get('http://localhost:8000/api/portfolio/recommendations');
       setRecommendations(response.data.recommendations);
-      setCachedData(CACHE_KEYS.RECOMMENDATIONS, response.data.recommendations, CACHE_EXPIRY.RECOMMENDATIONS);
       setErrors(prev => ({ ...prev, recommendations: null }));
     } catch (err) {
       setErrors(prev => ({ ...prev, recommendations: 'Failed to fetch recommendations' }));

@@ -6,9 +6,11 @@ from ..core.config import settings
 from ..core.cache import get_cached_data, set_cached_data
 from ..models.portfolio import PortfolioSummary, PortfolioAssetsResponse, AssetAllocation
 from ..services.market_data import get_stock_price, get_crypto_price, fetch_web_data
+from ..services.ai import query_ai_model
 from database import SessionLocal
 from ..models.database import Portfolio, PortfolioAsset
 import asyncio
+import logging
 
 router = APIRouter()
 
@@ -75,11 +77,11 @@ async def get_portfolio_assets(db: Session = Depends(get_db)):
         current_time = datetime.now(timezone.utc)
         next_update = current_time + timedelta(hours=24)  # Schedule next update in 24 hours
         
-        # Count assets needing update
+        # Count assets needing update - ensure all datetimes are timezone-aware
         assets_needing_update = sum(
             1 for asset in assets
             if not asset.last_updated or 
-            (current_time - asset.last_updated).total_seconds() >= 24 * 3600
+            (asset.last_updated.replace(tzinfo=None) < (current_time - timedelta(hours=24)).replace(tzinfo=None))
         )
         
         response_data = {
@@ -95,7 +97,7 @@ async def get_portfolio_assets(db: Session = Depends(get_db)):
                 "gain_loss": (asset.current_price - asset.purchase_price) * asset.quantity,
                 "gain_loss_percentage": ((asset.current_price - asset.purchase_price) / asset.purchase_price * 100) 
                     if asset.purchase_price > 0 else 0,
-                "last_updated": asset.last_updated.isoformat() if asset.last_updated else current_time.isoformat()
+                "last_updated": asset.last_updated.replace(tzinfo=timezone.utc).isoformat() if asset.last_updated else current_time.isoformat()
             } for asset in assets],
             "last_updated": current_time.isoformat(),
             "update_status": {
@@ -120,51 +122,57 @@ async def get_portfolio_assets(db: Session = Depends(get_db)):
 @router.get("/allocation", response_model=AssetAllocation)
 async def get_portfolio_allocation(db: Session = Depends(get_db)):
     """Get portfolio allocation by asset type and individual holdings"""
-    portfolio = db.query(Portfolio).first()
-    if not portfolio:
-        raise HTTPException(status_code=404, detail="Portfolio not found")
-    
-    assets = db.query(PortfolioAsset).filter(
-        PortfolioAsset.portfolio_id == portfolio.id
-    ).all()
-    
-    total_value = sum(asset.quantity * asset.current_price for asset in assets)
-    
-    # Group by asset type
-    type_allocation = {}
-    for asset in assets:
-        value = asset.quantity * asset.current_price
-        if asset.asset_type not in type_allocation:
-            type_allocation[asset.asset_type] = 0
-        type_allocation[asset.asset_type] += value
-    
-    # Calculate individual asset allocation
-    holdings_allocation = []
-    for asset in assets:
-        value = asset.quantity * asset.current_price
-        percentage = (value / total_value * 100) if total_value > 0 else 0
-        if percentage >= 0.1:  # Only include holdings that are 0.1% or more of the portfolio
+    try:
+        portfolio = db.query(Portfolio).first()
+        if not portfolio:
+            raise HTTPException(status_code=404, detail="Portfolio not found")
+        
+        assets = db.query(PortfolioAsset).filter(
+            PortfolioAsset.portfolio_id == portfolio.id
+        ).all()
+        
+        total_value = sum(asset.quantity * asset.current_price for asset in assets)
+        
+        # Group by asset type
+        type_allocation = {}
+        for asset in assets:
+            value = asset.quantity * asset.current_price
+            if asset.asset_type not in type_allocation:
+                type_allocation[asset.asset_type] = 0
+            type_allocation[asset.asset_type] += value
+        
+        # Calculate percentages for type allocation
+        type_allocation_percentages = {
+            asset_type: (value / total_value * 100) if total_value > 0 else 0
+            for asset_type, value in type_allocation.items()
+        }
+        
+        # Calculate individual asset allocation
+        holdings_allocation = []
+        for asset in assets:
+            value = asset.quantity * asset.current_price
+            percentage = (value / total_value * 100) if total_value > 0 else 0
             holdings_allocation.append({
                 "symbol": asset.symbol,
                 "name": asset.name,
                 "value": value,
                 "percentage": percentage
             })
-    
-    # Sort holdings by percentage in descending order
-    holdings_allocation.sort(key=lambda x: x["percentage"], reverse=True)
-    
-    # Convert type allocation to percentages
-    type_allocation_percentages = {
-        asset_type: (value / total_value * 100) if total_value > 0 else 0
-        for asset_type, value in type_allocation.items()
-    }
-    
-    return AssetAllocation(
-        total_value=total_value,
-        by_type=type_allocation_percentages,
-        by_holding=holdings_allocation
-    )
+        
+        # Sort holdings by percentage in descending order
+        holdings_allocation.sort(key=lambda x: x["percentage"], reverse=True)
+        
+        return AssetAllocation(
+            total_value=total_value,
+            by_type=type_allocation_percentages,
+            by_holding=holdings_allocation
+        )
+    except Exception as e:
+        print(f"Error in get_portfolio_allocation: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 @router.get("/update-prices")
 async def update_portfolio_prices(db: Session = Depends(get_db)):
@@ -256,6 +264,9 @@ async def get_portfolio_recommendations(db: Session = Depends(get_db)):
         assets = db.query(PortfolioAsset).all()
         recommendations = []
         
+        # Calculate portfolio total value for percentage calculations
+        total_portfolio_value = sum(asset.quantity * asset.current_price for asset in assets)
+        
         # Process assets in smaller batches to avoid overwhelming APIs
         BATCH_SIZE = 3  # Process 3 assets at a time
         for i in range(0, len(assets), BATCH_SIZE):
@@ -266,30 +277,134 @@ async def get_portfolio_recommendations(db: Session = Depends(get_db)):
                     print(f"Processing recommendations for {asset.symbol}...")
                     web_data = await fetch_web_data(asset.symbol)
                     
+                    # Validate that we have necessary data before proceeding
+                    news_articles = web_data.get("news", [])
+                    if not news_articles:
+                        logger.warning(f"No news data available for {asset.symbol}, checking cache")
+                        news_articles = await get_cached_data(f"news_{asset.symbol}", "NEWS")
+                    
+                    if not news_articles:
+                        logger.warning(f"No news data available for {asset.symbol} in cache either, skipping AI analysis")
+                        value = asset.quantity * asset.current_price
+                        gain_loss = (asset.current_price - asset.purchase_price) * asset.quantity
+                        gain_loss_percentage = ((asset.current_price - asset.purchase_price) / asset.purchase_price * 100) if asset.purchase_price > 0 else 0
+                        portfolio_percentage = (value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0
+                        
+                        recommendations.append({
+                            "symbol": asset.symbol,
+                            "name": asset.name,
+                            "value": value,
+                            "analysis": (
+                                f"Waiting for news data to provide analysis.\n"
+                                f"Current Position:\n"
+                                f"• Holdings: {asset.quantity:,.2f} shares at ${asset.current_price:,.2f}\n"
+                                f"• Total Value: ${value:,.2f} ({portfolio_percentage:.1f}% of portfolio)\n"
+                                f"• Performance: {gain_loss_percentage:+.2f}% (${gain_loss:+,.2f})"
+                            ),
+                            "news": [],
+                            "last_updated": datetime.now(timezone.utc).isoformat()
+                        })
+                        continue
+
+                    # Calculate basic metrics
+                    value = asset.quantity * asset.current_price
+                    gain_loss = (asset.current_price - asset.purchase_price) * asset.quantity
+                    gain_loss_percentage = ((asset.current_price - asset.purchase_price) / asset.purchase_price * 100) if asset.purchase_price > 0 else 0
+                    portfolio_percentage = (value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0
+                    
+                    # Prepare context for AI analysis
+                    analysis_context = {
+                        "asset": {
+                            "symbol": asset.symbol,
+                            "name": asset.name,
+                            "type": asset.asset_type,
+                            "quantity": asset.quantity,
+                            "current_price": asset.current_price,
+                            "purchase_price": asset.purchase_price,
+                            "current_value": value,
+                            "portfolio_weight": portfolio_percentage,
+                            "gain_loss": gain_loss,
+                            "gain_loss_percentage": gain_loss_percentage
+                        },
+                        "market_data": web_data.get("market_data", {}),
+                        "analyst_ratings": web_data.get("analyst_ratings", {}),
+                        "news": news_articles
+                    }
+                    
+                    # Generate AI analysis only if we have news data
+                    analysis_prompt = f"""Analyze {asset.symbol} ({asset.name}) and determine if the outlook is BULLISH or BEARISH based on recent news and performance data.
+
+Recent News Analysis:
+{chr(10).join([f"• {article.get('title')} - {article.get('summary', '')[:200]}..." for article in news_articles[:3]])}
+
+Position & Performance Data:
+• Holdings: {asset.quantity:,.2f} shares at ${asset.current_price:,.2f}
+• Total Value: ${value:,.2f} ({portfolio_percentage:.1f}% of portfolio)
+• Performance: {gain_loss_percentage:+.2f}% (${gain_loss:+,.2f})
+• Market Data: {web_data.get('market_data', {})}
+• Analyst Ratings: {web_data.get('analyst_ratings', {})}
+
+Provide a concise 3-4 sentence analysis that:
+1. Starts with either "BULLISH" or "BEARISH" in caps
+2. Directly references the most significant news item and its impact
+3. Integrates performance data with news sentiment
+4. Concludes with a specific recommendation for position management"""
+
+                    try:
+                        ai_response = await query_ai_model(analysis_prompt, analysis_context)
+                        ai_analysis = ai_response.get("answer", "Analysis pending...")
+                    except Exception as ai_error:
+                        print(f"Error generating AI analysis for {asset.symbol}: {str(ai_error)}")
+                        ai_analysis = f"Error generating analysis. Current Position: {asset.quantity:,.2f} shares at ${asset.current_price:,.2f}, total value ${value:,.2f} ({portfolio_percentage:.1f}% of portfolio). Performance: {gain_loss_percentage:+.2f}% (${gain_loss:+,.2f})"
+                    
+                    # Create recommendation with all available data
+                    recommendation = {
+                        "symbol": asset.symbol,
+                        "name": asset.name,
+                        "value": value,
+                        "analysis": ai_analysis,
+                        "news": news_articles[:3],  # Include top 3 news articles
+                        "last_updated": datetime.now(timezone.utc).isoformat()
+                    }
+                    
+                    recommendations.append(recommendation)
+                    
                     # Add a smaller delay between individual asset processing
-                    await asyncio.sleep(1)  # Reduced from 2 seconds to 1 second
+                    await asyncio.sleep(1)
     
                 except Exception as e:
                     print(f"Error analyzing {asset.symbol}: {str(e)}")
+                    # Still provide basic information even if web data fails
+                    value = asset.quantity * asset.current_price
+                    gain_loss = (asset.current_price - asset.purchase_price) * asset.quantity
+                    gain_loss_percentage = ((asset.current_price - asset.purchase_price) / asset.purchase_price * 100) if asset.purchase_price > 0 else 0
+                    portfolio_percentage = (value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0
+                    
                     recommendations.append({
                         "symbol": asset.symbol,
                         "name": asset.name,
-                        "value": asset.quantity * asset.current_price,
-                        "analysis": "Error generating recommendations. Please try again later.",
-                        "error": str(e),
+                        "value": value,
+                        "analysis": (
+                            f"Position Summary:\n"
+                            f"• Holdings: {asset.quantity:,.2f} shares at ${asset.current_price:,.2f}\n"
+                            f"• Total Value: ${value:,.2f} ({portfolio_percentage:.1f}% of portfolio)\n"
+                            f"• Performance: {gain_loss_percentage:+.2f}% (${gain_loss:+,.2f})\n\n"
+                            "Additional market data temporarily unavailable."
+                        ),
+                        "news": [],
                         "last_updated": datetime.now(timezone.utc).isoformat()
                     })
                 
             # Add a smaller delay between batches
             if i + BATCH_SIZE < len(assets):
                 print("Waiting between batches to respect API rate limits...")
-                await asyncio.sleep(3)  # Reduced from 5 seconds to 3 seconds
+                await asyncio.sleep(3)
         
         response_data = {
             "recommendations": recommendations,
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "status": "completed",
-            "error_count": len([r for r in recommendations if "error" in r])
+            "error_count": len([r for r in recommendations if not r.get("news")])
         }
         
         # Cache the recommendations
